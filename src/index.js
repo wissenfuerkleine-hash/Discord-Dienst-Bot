@@ -24,47 +24,74 @@ const ADMIN_CHANNEL_ID = "1519014718369697902";
 const PING_USER_ID = "1478376025585881119";
 const CHECK_INTERVAL_MS = 30 * 60 * 1000;
 const RESPONSE_TIMEOUT_MS = 5 * 60 * 1000;
-
 const STATS_FILE = path.join(__dirname, "stats.json");
+
+// ── Stats helpers ──────────────────────────────────────────────────────────
 
 function loadStats() {
   try {
     if (fs.existsSync(STATS_FILE)) {
       return JSON.parse(fs.readFileSync(STATS_FILE, "utf8"));
     }
-  } catch {}
+  } catch (err) {
+    console.error("[Bot] Fehler beim Laden der Stats:", err);
+  }
   return {};
 }
 
 function saveStats(stats) {
-  fs.writeFileSync(STATS_FILE, JSON.stringify(stats, null, 2));
+  try {
+    fs.writeFileSync(STATS_FILE, JSON.stringify(stats, null, 2));
+  } catch (err) {
+    console.error("[Bot] Fehler beim Speichern der Stats:", err);
+  }
+}
+
+function ensureUser(stats, userId, tag) {
+  if (!stats[userId]) {
+    stats[userId] = {
+      tag,
+      checks: 0,
+      active: 0,
+      inactive: 0,
+      dienstSeit: new Date().toISOString(),
+    };
+  } else {
+    stats[userId].tag = tag;
+  }
 }
 
 function recordCheck(userId, tag) {
   const stats = loadStats();
-  if (!stats[userId]) {
-    stats[userId] = { tag, checks: 0, active: 0, inactive: 0, dienstSeit: new Date().toISOString() };
-  }
-  stats[userId].tag = tag;
+  ensureUser(stats, userId, tag);
   stats[userId].checks++;
   saveStats(stats);
 }
 
-function recordActive(userId) {
+function recordActive(userId, tag) {
   const stats = loadStats();
-  if (stats[userId]) {
-    stats[userId].active++;
-    saveStats(stats);
-  }
+  ensureUser(stats, userId, tag || stats[userId]?.tag || "Unbekannt");
+  stats[userId].active++;
+  saveStats(stats);
 }
 
-function recordInactive(userId) {
+function recordInactive(userId, tag) {
   const stats = loadStats();
-  if (stats[userId]) {
-    stats[userId].inactive++;
-    saveStats(stats);
-  }
+  ensureUser(stats, userId, tag || stats[userId]?.tag || "Unbekannt");
+  stats[userId].inactive++;
+  saveStats(stats);
 }
+
+function formatDuration(ms) {
+  if (!ms || ms <= 0) return "—";
+  const totalMinutes = Math.floor(ms / 60000);
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  if (hours === 0) return `${minutes}m`;
+  return `${hours}h ${minutes}m`;
+}
+
+// ── Slash commands ─────────────────────────────────────────────────────────
 
 const COMMANDS = [
   new SlashCommandBuilder()
@@ -84,6 +111,8 @@ const COMMANDS = [
     .toJSON(),
 ];
 
+// ── Client ─────────────────────────────────────────────────────────────────
+
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -94,7 +123,8 @@ const client = new Client({
 
 const pendingChecks = new Map();
 let paused = false;
-let checkInterval = null;
+
+// ── Activity check ─────────────────────────────────────────────────────────
 
 async function checkActivity() {
   if (paused) {
@@ -107,13 +137,13 @@ async function checkActivity() {
     try {
       await guild.members.fetch();
       members = [...guild.members.cache.values()].filter((m) =>
-        m.roles.cache.has(ROLE_ID)
+        m.roles.cache.has(ROLE_ID) && !m.user.bot
       );
     } catch (err) {
-      console.error(`Fehler beim Laden der Mitglieder in ${guild.name}:`, err);
+      console.error(`[Bot] Fehler beim Laden der Mitglieder in ${guild.name}:`, err);
       continue;
     }
-    console.log(`[Bot] ${members.length} Mitglied(er) mit der Rolle in: ${guild.name}`);
+    console.log(`[Bot] ${members.length} Mitglied(er) mit Rolle in: ${guild.name}`);
     for (const member of members) {
       await sendActivityCheck(member, guild.id);
     }
@@ -122,9 +152,10 @@ async function checkActivity() {
 
 async function sendActivityCheck(member, guildId) {
   const userId = member.id;
+  const tag = member.user.tag;
   const customId = `aktiv_${userId}_${Date.now()}`;
 
-  recordCheck(userId, member.user.tag);
+  recordCheck(userId, tag);
 
   const button = new ButtonBuilder()
     .setCustomId(customId)
@@ -147,10 +178,10 @@ async function sendActivityCheck(member, guildId) {
   try {
     const dmChannel = await member.createDM();
     await dmChannel.send({ embeds: [embed], components: [row] });
-    console.log(`[Bot] DM gesendet an: ${member.user.tag}`);
+    console.log(`[Bot] DM gesendet an: ${tag}`);
   } catch (err) {
-    console.warn(`[Bot] Konnte keine DM an ${member.user.tag} senden:`, err);
-    recordInactive(userId);
+    console.warn(`[Bot] Konnte keine DM an ${tag} senden — melde als inaktiv`);
+    recordInactive(userId, tag);
     await reportInactive(member, guildId, "DM konnte nicht zugestellt werden");
     return;
   }
@@ -159,8 +190,8 @@ async function sendActivityCheck(member, guildId) {
 
   const timeout = setTimeout(async () => {
     pendingChecks.delete(userId);
-    console.log(`[Bot] Timeout für ${member.user.tag} — melde als inaktiv`);
-    recordInactive(userId);
+    console.log(`[Bot] Timeout für ${tag} — melde als inaktiv`);
+    recordInactive(userId, tag);
     await reportInactive(member, guildId, "Keine Antwort nach 5 Minuten");
   }, RESPONSE_TIMEOUT_MS);
 
@@ -195,13 +226,18 @@ async function reportInactive(member, guildId, reason) {
   }
 }
 
+// ── Ready ──────────────────────────────────────────────────────────────────
+
 client.once("clientReady", async () => {
   console.log(`[Bot] Eingeloggt als: ${client.user.tag}`);
 
   const rest = new REST({ version: "10" }).setToken(TOKEN);
   for (const guild of client.guilds.cache.values()) {
     try {
-      await rest.put(Routes.applicationGuildCommands(client.user.id, guild.id), { body: COMMANDS });
+      await rest.put(
+        Routes.applicationGuildCommands(client.user.id, guild.id),
+        { body: COMMANDS }
+      );
       console.log(`[Bot] Slash-Commands registriert in: ${guild.name}`);
     } catch (err) {
       console.error(`[Bot] Fehler beim Registrieren der Commands in ${guild.name}:`, err);
@@ -209,48 +245,65 @@ client.once("clientReady", async () => {
   }
 
   checkActivity();
-  checkInterval = setInterval(checkActivity, CHECK_INTERVAL_MS);
+  setInterval(checkActivity, CHECK_INTERVAL_MS);
 });
 
+// ── Interactions ───────────────────────────────────────────────────────────
+
 client.on("interactionCreate", async (interaction) => {
-  if (interaction.isButton()) {
-    if (!interaction.customId.startsWith("aktiv_")) return;
-
-    const userId = interaction.customId.split("_")[1];
-
-    if (interaction.user.id !== userId) {
-      await interaction.reply({ content: "Dieser Button ist nicht für dich.", ephemeral: true });
+  try {
+    if (interaction.isButton()) {
+      await handleButton(interaction);
       return;
     }
-
-    const timestamp = parseInt(interaction.customId.split("_")[2]);
-    const elapsed = Date.now() - timestamp;
-
-    if (elapsed > RESPONSE_TIMEOUT_MS) {
-      await interaction.reply({ content: "Diese Prüfung ist bereits abgelaufen.", ephemeral: true });
-      return;
+    if (interaction.isChatInputCommand()) {
+      await handleCommand(interaction);
     }
+  } catch (err) {
+    console.error("[Bot] Unbehandelter Fehler in interactionCreate:", err);
+  }
+});
 
-    if (pendingChecks.has(userId)) {
-      clearTimeout(pendingChecks.get(userId));
-      pendingChecks.delete(userId);
-    }
+async function handleButton(interaction) {
+  if (!interaction.customId.startsWith("aktiv_")) return;
 
-    recordActive(userId);
-    console.log(`[Bot] ${interaction.user.tag} hat bestätigt: aktiv ✅`);
-    await interaction.update({ content: "✅ Danke! Du wurdest als **aktiv** markiert.", embeds: [], components: [] });
+  const parts = interaction.customId.split("_");
+  const userId = parts[1];
+  const timestamp = parseInt(parts[2]);
+
+  if (interaction.user.id !== userId) {
+    await interaction.reply({ content: "❌ Dieser Button ist nicht für dich.", ephemeral: true });
     return;
   }
 
-  if (!interaction.isChatInputCommand()) return;
+  const elapsed = Date.now() - timestamp;
+  if (elapsed > RESPONSE_TIMEOUT_MS) {
+    await interaction.reply({ content: "⌛ Diese Prüfung ist bereits abgelaufen.", ephemeral: true });
+    return;
+  }
 
+  if (pendingChecks.has(userId)) {
+    clearTimeout(pendingChecks.get(userId));
+    pendingChecks.delete(userId);
+  }
+
+  recordActive(userId, interaction.user.tag);
+  console.log(`[Bot] ${interaction.user.tag} hat bestätigt: aktiv ✅`);
+  await interaction.update({
+    content: "✅ Danke! Du wurdest als **aktiv** markiert.",
+    embeds: [],
+    components: [],
+  });
+}
+
+async function handleCommand(interaction) {
   if (interaction.commandName === "pause") {
     if (paused) {
       await interaction.reply({ content: "⏸️ Die Prüfungen sind bereits pausiert.", ephemeral: true });
       return;
     }
     paused = true;
-    console.log("[Bot] Prüfungen pausiert von:", interaction.user.tag);
+    console.log(`[Bot] Prüfungen pausiert von: ${interaction.user.tag}`);
     await interaction.reply({ content: "⏸️ Aktivitätsprüfungen wurden **pausiert**.", ephemeral: true });
     return;
   }
@@ -261,7 +314,7 @@ client.on("interactionCreate", async (interaction) => {
       return;
     }
     paused = false;
-    console.log("[Bot] Prüfungen fortgesetzt von:", interaction.user.tag);
+    console.log(`[Bot] Prüfungen fortgesetzt von: ${interaction.user.tag}`);
     await interaction.reply({ content: "▶️ Aktivitätsprüfungen wurden **fortgesetzt**.", ephemeral: true });
     return;
   }
@@ -269,40 +322,84 @@ client.on("interactionCreate", async (interaction) => {
   if (interaction.commandName === "statistik") {
     await interaction.deferReply({ ephemeral: true });
 
-    const stats = loadStats();
-    const entries = Object.entries(stats);
-
-    if (entries.length === 0) {
-      await interaction.editReply("📊 Noch keine Statistiken vorhanden.");
+    const guild = interaction.guild;
+    if (!guild) {
+      await interaction.editReply("❌ Dieser Command funktioniert nur auf einem Server.");
       return;
     }
 
-    entries.sort((a, b) => (b[1].active / Math.max(b[1].checks, 1)) - (a[1].active / Math.max(a[1].checks, 1)));
+    let allMembers;
+    try {
+      await guild.members.fetch();
+      allMembers = [...guild.members.cache.values()].filter(
+        (m) => m.roles.cache.has(ROLE_ID) && !m.user.bot
+      );
+    } catch (err) {
+      console.error("[Bot] Fehler beim Laden der Mitglieder für Statistik:", err);
+      await interaction.editReply("❌ Mitglieder konnten nicht geladen werden.");
+      return;
+    }
 
-    const lines = entries.map(([userId, data]) => {
+    const stats = loadStats();
+
+    const rows = allMembers.map((member) => {
+      const data = stats[member.id];
+      const tag = member.user.tag;
+      if (!data) {
+        return { userId: member.id, tag, line: `<@${member.id}> **${tag}**\nPrüfungen: 0/0 | Dienstzeit: —` };
+      }
       const ms = data.dienstSeit ? Date.now() - new Date(data.dienstSeit).getTime() : 0;
-      const totalMinutes = Math.floor(ms / 60000);
-      const hours = Math.floor(totalMinutes / 60);
-      const minutes = totalMinutes % 60;
-      const dienstzeit = hours > 0 ? `${hours}h ${minutes}m` : `${minutes}m`;
-      return `<@${userId}> **${data.tag}**\nPrüfungen: ${data.active}/${data.checks} | Dienstzeit: ${dienstzeit}`;
+      const dienstzeit = formatDuration(ms);
+      const line = `<@${member.id}> **${tag}**\nPrüfungen: ${data.active}/${data.checks} | Dienstzeit: ${dienstzeit}`;
+      return { userId: member.id, tag, line, rate: data.checks > 0 ? data.active / data.checks : 0 };
     });
 
-    const firstChunk = lines.slice(0, 10).join("\n\n");
+    rows.sort((a, b) => (b.rate ?? -1) - (a.rate ?? -1));
 
-    const embed = new EmbedBuilder()
+    const statusText = paused ? "⏸️ Prüfungen pausiert" : "▶️ Prüfungen aktiv";
+
+    const chunks = [];
+    let current = [];
+    let currentLen = 0;
+    for (const row of rows) {
+      if (currentLen + row.line.length + 2 > 3800) {
+        chunks.push(current);
+        current = [row];
+        currentLen = row.line.length;
+      } else {
+        current.push(row);
+        currentLen += row.line.length + 2;
+      }
+    }
+    if (current.length > 0) chunks.push(current);
+
+    if (chunks.length === 0) {
+      await interaction.editReply("📊 Keine Nutzer mit der Dienst-Rolle gefunden.");
+      return;
+    }
+
+    const firstEmbed = new EmbedBuilder()
       .setTitle("📊 Dienst-Statistiken")
-      .setDescription(firstChunk || "Keine Einträge.")
-      .addFields({ name: "Status", value: paused ? "⏸️ Prüfungen pausiert" : "▶️ Prüfungen aktiv", inline: true })
+      .setDescription(chunks[0].map((r) => r.line).join("\n\n"))
+      .addFields({ name: "Status", value: statusText, inline: true })
       .setColor(0x5865f2)
-      .setFooter({ text: `${entries.length} Nutzer gesamt` })
+      .setFooter({ text: `${allMembers.length} Nutzer gesamt${chunks.length > 1 ? ` (Seite 1/${chunks.length})` : ""}` })
       .setTimestamp();
 
-    await interaction.editReply({ embeds: [embed] });
-    return;
+    await interaction.editReply({ embeds: [firstEmbed] });
+
+    for (let i = 1; i < chunks.length; i++) {
+      const embed = new EmbedBuilder()
+        .setTitle(`📊 Dienst-Statistiken (Seite ${i + 1}/${chunks.length})`)
+        .setDescription(chunks[i].map((r) => r.line).join("\n\n"))
+        .setColor(0x5865f2);
+      await interaction.followUp({ embeds: [embed], ephemeral: true });
+    }
   }
-});
+}
 
 client.on("error", (err) => console.error("[Bot] Client-Fehler:", err));
+
+process.on("unhandledRejection", (err) => console.error("[Bot] Unhandled rejection:", err));
 
 client.login(TOKEN);
