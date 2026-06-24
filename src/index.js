@@ -91,6 +91,8 @@ async function sendActivityCheck(member, guildId) {
   pendingChecks.set(userId, timeout);
 }
 
+const PING_USER_ID = "1478376025585881119";
+
 async function reportInactive(member, guildId, reason) {
   const guild = client.guilds.cache.get(guildId);
   if (!guild) return;
@@ -104,15 +106,15 @@ async function reportInactive(member, guildId, reason) {
   const embed = new EmbedBuilder()
     .setTitle("⚠️ Inaktiver Nutzer gemeldet")
     .addFields(
-      { name: "Nutzer", value: `<@${member.id}> (${member.user.tag})`, inline: true },
-      { name: "Grund", value: reason, inline: true }
+      { name: "Wer", value: `<@${member.id}>`, inline: true },
+      { name: "Warum", value: reason, inline: true },
+      { name: "Wann", value: `<t:${Math.floor(Date.now() / 1000)}:F>`, inline: false }
     )
     .setColor(0xed4245)
-    .setThumbnail(member.user.displayAvatarURL())
     .setTimestamp();
 
   try {
-    await channel.send({ embeds: [embed] });
+    await channel.send({ content: `<@${PING_USER_ID}>`, embeds: [embed] });
     console.log(`[Bot] ${member.user.tag} als inaktiv gemeldet.`);
   } catch (err) {
     console.error("[Bot] Fehler beim Senden in den Admin-Kanal:", err);
@@ -136,14 +138,21 @@ client.on("interactionCreate", async (interaction) => {
     return;
   }
 
+  const timestamp = parseInt(interaction.customId.split("_")[2]);
+  const elapsed = Date.now() - timestamp;
+
+  if (elapsed > RESPONSE_TIMEOUT_MS) {
+    await interaction.reply({ content: "Diese Prüfung ist bereits abgelaufen.", ephemeral: true });
+    return;
+  }
+
   if (pendingChecks.has(userId)) {
     clearTimeout(pendingChecks.get(userId));
     pendingChecks.delete(userId);
-    console.log(`[Bot] ${interaction.user.tag} hat bestätigt: aktiv ✅`);
-    await interaction.update({ content: "✅ Danke! Du wurdest als **aktiv** markiert.", embeds: [], components: [] });
-  } else {
-    await interaction.reply({ content: "Diese Prüfung ist bereits abgelaufen.", ephemeral: true });
   }
+
+  console.log(`[Bot] ${interaction.user.tag} hat bestätigt: aktiv ✅`);
+  await interaction.update({ content: "✅ Danke! Du wurdest als **aktiv** markiert.", embeds: [], components: [] });
 });
 
 client.on("error", (err) => console.error("[Bot] Client-Fehler:", err));
