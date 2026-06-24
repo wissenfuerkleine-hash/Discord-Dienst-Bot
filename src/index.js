@@ -5,6 +5,7 @@ const {
   ButtonBuilder,
   ButtonStyle,
   EmbedBuilder,
+  MessageFlags,
   REST,
   Routes,
   SlashCommandBuilder,
@@ -272,13 +273,13 @@ async function handleButton(interaction) {
   const timestamp = parseInt(parts[2]);
 
   if (interaction.user.id !== userId) {
-    await interaction.reply({ content: "❌ Dieser Button ist nicht für dich.", ephemeral: true });
+    await interaction.reply({ content: "❌ Dieser Button ist nicht für dich.", flags: MessageFlags.Ephemeral });
     return;
   }
 
   const elapsed = Date.now() - timestamp;
   if (elapsed > RESPONSE_TIMEOUT_MS) {
-    await interaction.reply({ content: "⌛ Diese Prüfung ist bereits abgelaufen.", ephemeral: true });
+    await interaction.reply({ content: "⌛ Diese Prüfung ist bereits abgelaufen.", flags: MessageFlags.Ephemeral });
     return;
   }
 
@@ -299,28 +300,28 @@ async function handleButton(interaction) {
 async function handleCommand(interaction) {
   if (interaction.commandName === "pause") {
     if (paused) {
-      await interaction.reply({ content: "⏸️ Die Prüfungen sind bereits pausiert.", ephemeral: true });
+      await interaction.reply({ content: "⏸️ Die Prüfungen sind bereits pausiert.", flags: MessageFlags.Ephemeral });
       return;
     }
     paused = true;
     console.log(`[Bot] Prüfungen pausiert von: ${interaction.user.tag}`);
-    await interaction.reply({ content: "⏸️ Aktivitätsprüfungen wurden **pausiert**.", ephemeral: true });
+    await interaction.reply({ content: "⏸️ Aktivitätsprüfungen wurden **pausiert**.", flags: MessageFlags.Ephemeral });
     return;
   }
 
   if (interaction.commandName === "fortsetzen") {
     if (!paused) {
-      await interaction.reply({ content: "▶️ Die Prüfungen laufen bereits.", ephemeral: true });
+      await interaction.reply({ content: "▶️ Die Prüfungen laufen bereits.", flags: MessageFlags.Ephemeral });
       return;
     }
     paused = false;
     console.log(`[Bot] Prüfungen fortgesetzt von: ${interaction.user.tag}`);
-    await interaction.reply({ content: "▶️ Aktivitätsprüfungen wurden **fortgesetzt**.", ephemeral: true });
+    await interaction.reply({ content: "▶️ Aktivitätsprüfungen wurden **fortgesetzt**.", flags: MessageFlags.Ephemeral });
     return;
   }
 
   if (interaction.commandName === "statistik") {
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
     const guild = interaction.guild;
     if (!guild) {
@@ -328,16 +329,23 @@ async function handleCommand(interaction) {
       return;
     }
 
-    let allMembers;
-    try {
-      await guild.members.fetch();
-      allMembers = [...guild.members.cache.values()].filter(
-        (m) => m.roles.cache.has(ROLE_ID) && !m.user.bot
-      );
-    } catch (err) {
-      console.error("[Bot] Fehler beim Laden der Mitglieder für Statistik:", err);
-      await interaction.editReply("❌ Mitglieder konnten nicht geladen werden.");
-      return;
+    // Use the already-cached members to avoid rate limits from guild.members.fetch()
+    // Only fetch if the cache appears empty (bot just started and no check ran yet)
+    let allMembers = [...guild.members.cache.values()].filter(
+      (m) => m.roles.cache.has(ROLE_ID) && !m.user.bot
+    );
+
+    if (guild.members.cache.size <= 1) {
+      try {
+        await guild.members.fetch();
+        allMembers = [...guild.members.cache.values()].filter(
+          (m) => m.roles.cache.has(ROLE_ID) && !m.user.bot
+        );
+      } catch (err) {
+        console.error("[Bot] Fehler beim Laden der Mitglieder für Statistik:", err);
+        await interaction.editReply("❌ Mitglieder konnten nicht geladen werden. Bitte in 10 Sekunden erneut versuchen.");
+        return;
+      }
     }
 
     const stats = loadStats();
@@ -393,7 +401,7 @@ async function handleCommand(interaction) {
         .setTitle(`📊 Dienst-Statistiken (Seite ${i + 1}/${chunks.length})`)
         .setDescription(chunks[i].map((r) => r.line).join("\n\n"))
         .setColor(0x5865f2);
-      await interaction.followUp({ embeds: [embed], ephemeral: true });
+      await interaction.followUp({ embeds: [embed], flags: MessageFlags.Ephemeral });
     }
   }
 }
