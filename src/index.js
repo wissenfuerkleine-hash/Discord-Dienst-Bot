@@ -280,13 +280,15 @@ client.on("interactionCreate", async (interaction) => {
     entries.sort((a, b) => (b[1].active / Math.max(b[1].checks, 1)) - (a[1].active / Math.max(a[1].checks, 1)));
 
     const lines = entries.map(([userId, data]) => {
-      const rate = data.checks > 0 ? Math.round((data.active / data.checks) * 100) : 0;
-      const seit = data.dienstSeit ? `<t:${Math.floor(new Date(data.dienstSeit).getTime() / 1000)}:d>` : "—";
-      return `<@${userId}> — ✅ ${data.active}/${data.checks} (${rate}%) | Dabei seit: ${seit}`;
+      const ms = data.dienstSeit ? Date.now() - new Date(data.dienstSeit).getTime() : 0;
+      const totalMinutes = Math.floor(ms / 60000);
+      const hours = Math.floor(totalMinutes / 60);
+      const minutes = totalMinutes % 60;
+      const dienstzeit = hours > 0 ? `${hours}h ${minutes}m` : `${minutes}m`;
+      return `<@${userId}> **${data.tag}**\nPrüfungen: ${data.active}/${data.checks} | Dienstzeit: ${dienstzeit}`;
     });
 
-    const chunkSize = 10;
-    const firstChunk = lines.slice(0, chunkSize).join("\n");
+    const firstChunk = lines.slice(0, 10).join("\n\n");
 
     const embed = new EmbedBuilder()
       .setTitle("📊 Dienst-Statistiken")
