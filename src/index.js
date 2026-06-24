@@ -5,7 +5,13 @@ const {
   ButtonBuilder,
   ButtonStyle,
   EmbedBuilder,
+  REST,
+  Routes,
+  SlashCommandBuilder,
+  PermissionFlagsBits,
 } = require("discord.js");
+const fs = require("fs");
+const path = require("path");
 
 const TOKEN = process.env.DISCORD_TOKEN;
 if (!TOKEN) {
@@ -15,8 +21,68 @@ if (!TOKEN) {
 
 const ROLE_ID = "1515119690219786250";
 const ADMIN_CHANNEL_ID = "1519014718369697902";
+const PING_USER_ID = "1478376025585881119";
 const CHECK_INTERVAL_MS = 30 * 60 * 1000;
 const RESPONSE_TIMEOUT_MS = 5 * 60 * 1000;
+
+const STATS_FILE = path.join(__dirname, "stats.json");
+
+function loadStats() {
+  try {
+    if (fs.existsSync(STATS_FILE)) {
+      return JSON.parse(fs.readFileSync(STATS_FILE, "utf8"));
+    }
+  } catch {}
+  return {};
+}
+
+function saveStats(stats) {
+  fs.writeFileSync(STATS_FILE, JSON.stringify(stats, null, 2));
+}
+
+function recordCheck(userId, tag) {
+  const stats = loadStats();
+  if (!stats[userId]) {
+    stats[userId] = { tag, checks: 0, active: 0, inactive: 0, dienstSeit: new Date().toISOString() };
+  }
+  stats[userId].tag = tag;
+  stats[userId].checks++;
+  saveStats(stats);
+}
+
+function recordActive(userId) {
+  const stats = loadStats();
+  if (stats[userId]) {
+    stats[userId].active++;
+    saveStats(stats);
+  }
+}
+
+function recordInactive(userId) {
+  const stats = loadStats();
+  if (stats[userId]) {
+    stats[userId].inactive++;
+    saveStats(stats);
+  }
+}
+
+const COMMANDS = [
+  new SlashCommandBuilder()
+    .setName("pause")
+    .setDescription("Aktivitätsprüfungen pausieren")
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageRoles)
+    .toJSON(),
+  new SlashCommandBuilder()
+    .setName("fortsetzen")
+    .setDescription("Aktivitätsprüfungen fortsetzen")
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageRoles)
+    .toJSON(),
+  new SlashCommandBuilder()
+    .setName("statistik")
+    .setDescription("Zeigt Aktivitätsstatistiken aller Dienst-Nutzer")
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageRoles)
+    .toJSON(),
+];
 
 const client = new Client({
   intents: [
@@ -27,8 +93,14 @@ const client = new Client({
 });
 
 const pendingChecks = new Map();
+let paused = false;
+let checkInterval = null;
 
 async function checkActivity() {
+  if (paused) {
+    console.log("[Bot] Prüfung übersprungen (pausiert)");
+    return;
+  }
   console.log("[Bot] Starte Aktivitätsprüfung...");
   for (const guild of client.guilds.cache.values()) {
     let members;
@@ -51,6 +123,8 @@ async function checkActivity() {
 async function sendActivityCheck(member, guildId) {
   const userId = member.id;
   const customId = `aktiv_${userId}_${Date.now()}`;
+
+  recordCheck(userId, member.user.tag);
 
   const button = new ButtonBuilder()
     .setCustomId(customId)
@@ -76,6 +150,7 @@ async function sendActivityCheck(member, guildId) {
     console.log(`[Bot] DM gesendet an: ${member.user.tag}`);
   } catch (err) {
     console.warn(`[Bot] Konnte keine DM an ${member.user.tag} senden:`, err);
+    recordInactive(userId);
     await reportInactive(member, guildId, "DM konnte nicht zugestellt werden");
     return;
   }
@@ -85,13 +160,12 @@ async function sendActivityCheck(member, guildId) {
   const timeout = setTimeout(async () => {
     pendingChecks.delete(userId);
     console.log(`[Bot] Timeout für ${member.user.tag} — melde als inaktiv`);
+    recordInactive(userId);
     await reportInactive(member, guildId, "Keine Antwort nach 5 Minuten");
   }, RESPONSE_TIMEOUT_MS);
 
   pendingChecks.set(userId, timeout);
 }
-
-const PING_USER_ID = "1478376025585881119";
 
 async function reportInactive(member, guildId, reason) {
   const guild = client.guilds.cache.get(guildId);
@@ -121,38 +195,110 @@ async function reportInactive(member, guildId, reason) {
   }
 }
 
-client.once("clientReady", () => {
+client.once("clientReady", async () => {
   console.log(`[Bot] Eingeloggt als: ${client.user.tag}`);
+
+  const rest = new REST({ version: "10" }).setToken(TOKEN);
+  for (const guild of client.guilds.cache.values()) {
+    try {
+      await rest.put(Routes.applicationGuildCommands(client.user.id, guild.id), { body: COMMANDS });
+      console.log(`[Bot] Slash-Commands registriert in: ${guild.name}`);
+    } catch (err) {
+      console.error(`[Bot] Fehler beim Registrieren der Commands in ${guild.name}:`, err);
+    }
+  }
+
   checkActivity();
-  setInterval(checkActivity, CHECK_INTERVAL_MS);
+  checkInterval = setInterval(checkActivity, CHECK_INTERVAL_MS);
 });
 
 client.on("interactionCreate", async (interaction) => {
-  if (!interaction.isButton()) return;
-  if (!interaction.customId.startsWith("aktiv_")) return;
+  if (interaction.isButton()) {
+    if (!interaction.customId.startsWith("aktiv_")) return;
 
-  const userId = interaction.customId.split("_")[1];
+    const userId = interaction.customId.split("_")[1];
 
-  if (interaction.user.id !== userId) {
-    await interaction.reply({ content: "Dieser Button ist nicht für dich.", ephemeral: true });
+    if (interaction.user.id !== userId) {
+      await interaction.reply({ content: "Dieser Button ist nicht für dich.", ephemeral: true });
+      return;
+    }
+
+    const timestamp = parseInt(interaction.customId.split("_")[2]);
+    const elapsed = Date.now() - timestamp;
+
+    if (elapsed > RESPONSE_TIMEOUT_MS) {
+      await interaction.reply({ content: "Diese Prüfung ist bereits abgelaufen.", ephemeral: true });
+      return;
+    }
+
+    if (pendingChecks.has(userId)) {
+      clearTimeout(pendingChecks.get(userId));
+      pendingChecks.delete(userId);
+    }
+
+    recordActive(userId);
+    console.log(`[Bot] ${interaction.user.tag} hat bestätigt: aktiv ✅`);
+    await interaction.update({ content: "✅ Danke! Du wurdest als **aktiv** markiert.", embeds: [], components: [] });
     return;
   }
 
-  const timestamp = parseInt(interaction.customId.split("_")[2]);
-  const elapsed = Date.now() - timestamp;
+  if (!interaction.isChatInputCommand()) return;
 
-  if (elapsed > RESPONSE_TIMEOUT_MS) {
-    await interaction.reply({ content: "Diese Prüfung ist bereits abgelaufen.", ephemeral: true });
+  if (interaction.commandName === "pause") {
+    if (paused) {
+      await interaction.reply({ content: "⏸️ Die Prüfungen sind bereits pausiert.", ephemeral: true });
+      return;
+    }
+    paused = true;
+    console.log("[Bot] Prüfungen pausiert von:", interaction.user.tag);
+    await interaction.reply({ content: "⏸️ Aktivitätsprüfungen wurden **pausiert**.", ephemeral: true });
     return;
   }
 
-  if (pendingChecks.has(userId)) {
-    clearTimeout(pendingChecks.get(userId));
-    pendingChecks.delete(userId);
+  if (interaction.commandName === "fortsetzen") {
+    if (!paused) {
+      await interaction.reply({ content: "▶️ Die Prüfungen laufen bereits.", ephemeral: true });
+      return;
+    }
+    paused = false;
+    console.log("[Bot] Prüfungen fortgesetzt von:", interaction.user.tag);
+    await interaction.reply({ content: "▶️ Aktivitätsprüfungen wurden **fortgesetzt**.", ephemeral: true });
+    return;
   }
 
-  console.log(`[Bot] ${interaction.user.tag} hat bestätigt: aktiv ✅`);
-  await interaction.update({ content: "✅ Danke! Du wurdest als **aktiv** markiert.", embeds: [], components: [] });
+  if (interaction.commandName === "statistik") {
+    await interaction.deferReply({ ephemeral: true });
+
+    const stats = loadStats();
+    const entries = Object.entries(stats);
+
+    if (entries.length === 0) {
+      await interaction.editReply("📊 Noch keine Statistiken vorhanden.");
+      return;
+    }
+
+    entries.sort((a, b) => (b[1].active / Math.max(b[1].checks, 1)) - (a[1].active / Math.max(a[1].checks, 1)));
+
+    const lines = entries.map(([userId, data]) => {
+      const rate = data.checks > 0 ? Math.round((data.active / data.checks) * 100) : 0;
+      const seit = data.dienstSeit ? `<t:${Math.floor(new Date(data.dienstSeit).getTime() / 1000)}:d>` : "—";
+      return `<@${userId}> — ✅ ${data.active}/${data.checks} (${rate}%) | Dabei seit: ${seit}`;
+    });
+
+    const chunkSize = 10;
+    const firstChunk = lines.slice(0, chunkSize).join("\n");
+
+    const embed = new EmbedBuilder()
+      .setTitle("📊 Dienst-Statistiken")
+      .setDescription(firstChunk || "Keine Einträge.")
+      .addFields({ name: "Status", value: paused ? "⏸️ Prüfungen pausiert" : "▶️ Prüfungen aktiv", inline: true })
+      .setColor(0x5865f2)
+      .setFooter({ text: `${entries.length} Nutzer gesamt` })
+      .setTimestamp();
+
+    await interaction.editReply({ embeds: [embed] });
+    return;
+  }
 });
 
 client.on("error", (err) => console.error("[Bot] Client-Fehler:", err));
